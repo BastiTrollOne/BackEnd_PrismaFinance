@@ -14,6 +14,13 @@ from app.api.v1 import agents as agents_router
 from app.agents import brain_agent as brain_agent_module # Metabase
 from app.agents import mcp_agent as mcp_agent_module     # OpenWebUI (El archivo que creamos antes)
 from app.agents.orchestrator import build_orchestrator   # El nuevo orquestador
+from fastapi import UploadFile, File, BackgroundTasks
+import shutil
+import os
+import time
+
+# Importamos el servicio ETL que acabamos de crear
+from app.services.graph_etl import run_graph_extraction
 
 # Configuración de Logs
 logging.basicConfig(level=logging.INFO, stream=sys.stdout)
@@ -76,6 +83,37 @@ async def shutdown_event():
     if hasattr(app.state, "exit_stack"):
         await app.state.exit_stack.aclose()
     logger.info("🔌 API Apagada.")
+
+@app.post("/upload", tags=["Ingestion"])
+async def upload_file(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...)
+):
+    """
+    Sube un archivo, lo guarda temporalmente y dispara el proceso ETL
+    (OCR -> Limpieza CSV -> Grafo) en segundo plano.
+    """
+    # 1. Guardar archivo localmente para que el ETL lo pueda leer
+    upload_dir = "/app/backups" # Asegúrate que este volumen exista en docker-compose
+    os.makedirs(upload_dir, exist_ok=True)
+    
+    safe_filename = file.filename.replace(" ", "_")
+    file_path = os.path.join(upload_dir, f"{int(time.time())}_{safe_filename}")
+    
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    
+    logger.info(f"📥 Archivo recibido: {safe_filename}. Iniciando ETL...")
+
+    # 2. Disparar el ETL (Tu código 'graph_agent.py') como tarea de fondo
+    # Esto no bloquea la respuesta al usuario
+    background_tasks.add_task(run_graph_extraction, file_path)
+
+    return {
+        "status": "success",
+        "message": "Archivo recibido. El procesamiento ETL (Grafo + OCR) ha comenzado en segundo plano.",
+        "filename": safe_filename
+    }
 
 # --- ENDPOINT PRINCIPAL ---
 @app.post("/chat", tags=["Orchestrator"])

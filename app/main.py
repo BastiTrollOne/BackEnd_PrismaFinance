@@ -1,8 +1,11 @@
 import logging
 import sys
 from contextlib import AsyncExitStack
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, UploadFile, File, BackgroundTasks
 from pydantic import BaseModel
+import shutil
+import os
+import time
 
 # Importaciones MCP y Agentes
 from mcp.client.sse import sse_client
@@ -12,15 +15,9 @@ from langchain_core.messages import HumanMessage
 # Tus módulos
 from app.api.v1 import agents as agents_router
 from app.agents import brain_agent as brain_agent_module # Metabase
-from app.agents import mcp_agent as mcp_agent_module     # OpenWebUI (El archivo que creamos antes)
+from app.agents import mcp_agent as mcp_agent_module     # OpenWebUI
 from app.agents.orchestrator import build_orchestrator   # El nuevo orquestador
-from fastapi import UploadFile, File, BackgroundTasks
-import shutil
-import os
-import time
-
-# Importamos el servicio ETL que acabamos de crear
-from app.services.graph_etl import run_graph_extraction
+from app.services.graph_etl import run_graph_extraction  # El servicio ETL
 
 # Configuración de Logs
 logging.basicConfig(level=logging.INFO, stream=sys.stdout)
@@ -44,7 +41,6 @@ async def startup_event():
     try:
         # --- 1. INICIAR AGENTE METABASE (Brain) ---
         logger.info("📊 Conectando a Metabase...")
-        # Esto arrancará el contenedor Docker de Metabase si usas initialize_mcp_client
         brain_agent_module.initialize_mcp_client() 
         metabase_tools = await brain_agent_module.mcp_client.get_tools(server_name="MCP_METABASE")
         brain_agent_instance = brain_agent_module.LangChainBrainAgent(tools=metabase_tools)
@@ -53,12 +49,10 @@ async def startup_event():
         # --- 2. INICIAR AGENTE OPEN WEBUI (MCP Worker) ---
         logger.info(f"🔧 Conectando a Open WebUI ({MCP_OPENWEBUI_URL})...")
         try:
-            # Conexión persistente SSE
             streams = await app.state.exit_stack.enter_async_context(sse_client(MCP_OPENWEBUI_URL))
             session = await app.state.exit_stack.enter_async_context(ClientSession(streams[0], streams[1]))
             await session.initialize()
             
-            # Construir el agente usando la sesión
             mcp_agent_instance = await mcp_agent_module.build_mcp_worker_agent(session)
             logger.info("✅ MCP OpenWebUI Agent listo.")
         except Exception as e:
@@ -66,7 +60,6 @@ async def startup_event():
             mcp_agent_instance = None
 
         # --- 3. PREPARAR EL ORQUESTADOR ---
-        # Guardamos los agentes en el estado de la app para usarlos en cada petición
         app.state.orchestrator = build_orchestrator()
         app.state.agents_config = {
             "brain_agent": brain_agent_instance,
@@ -74,8 +67,31 @@ async def startup_event():
         }
         logger.info("🤖 ORQUESTADOR OPERATIVO.")
 
+        # --- 4. INICIALIZAR ÍNDICES DE NEO4J (Bloque Try interno) ---
+        try:    
+            from langchain_community.graphs import Neo4jGraph
+            from app.core.config import settings
+            
+            logger.info("🔗 Verificando índices de Neo4j...")
+            graph = Neo4jGraph(
+                url=settings.NEO4J_URI,
+                username=settings.NEO4J_USERNAME,
+                password=settings.NEO4J_PASSWORD
+            )
+            # Crear restricciones de unicidad
+            graph.query("CREATE CONSTRAINT unique_persona_id IF NOT EXISTS FOR (p:Persona) REQUIRE p.id IS UNIQUE")
+            graph.query("CREATE CONSTRAINT unique_org_id IF NOT EXISTS FOR (o:Organizacion) REQUIRE o.id IS UNIQUE")
+            graph.query("CREATE CONSTRAINT unique_proy_id IF NOT EXISTS FOR (pr:Proyecto) REQUIRE pr.id IS UNIQUE")
+            graph.query("CREATE CONSTRAINT unique_doc_id IF NOT EXISTS FOR (d:Document) REQUIRE d.id IS UNIQUE")
+            
+            logger.info("✅ Índices de Neo4j listos.")
+        except Exception as e:
+            # Advertencia suave: Si falla Neo4j (ej. container lento), la API sigue funcionando
+            logger.warning(f"⚠️ No se pudieron crear índices en Neo4j (puede que el contenedor aún esté iniciando): {e}")
+
     except Exception as e:
-        logger.error(f"❌ Error fatal en inicio: {e}")
+        # Error fatal general
+        logger.error(f"❌ Error fatal en inicio de la aplicación: {e}")
         raise RuntimeError("Startup failed") from e
 
 @app.on_event("shutdown")
@@ -93,8 +109,7 @@ async def upload_file(
     Sube un archivo, lo guarda temporalmente y dispara el proceso ETL
     (OCR -> Limpieza CSV -> Grafo) en segundo plano.
     """
-    # 1. Guardar archivo localmente para que el ETL lo pueda leer
-    upload_dir = "/app/backups" # Asegúrate que este volumen exista en docker-compose
+    upload_dir = "/app/backups"
     os.makedirs(upload_dir, exist_ok=True)
     
     safe_filename = file.filename.replace(" ", "_")
@@ -105,8 +120,6 @@ async def upload_file(
     
     logger.info(f"📥 Archivo recibido: {safe_filename}. Iniciando ETL...")
 
-    # 2. Disparar el ETL (Tu código 'graph_agent.py') como tarea de fondo
-    # Esto no bloquea la respuesta al usuario
     background_tasks.add_task(run_graph_extraction, file_path)
 
     return {
@@ -126,7 +139,6 @@ async def chat_endpoint(request: UserQuery, fastapi_req: Request):
     inputs = {"messages": [HumanMessage(content=request.query)]}
     
     # Ejecutar el grafo del orquestador
-    # Pasamos 'config' en el parámetro 'configurable' para que los nodos accedan a los agentes
     result = await orchestrator.ainvoke(inputs, config={"configurable": config})
     
     return {
